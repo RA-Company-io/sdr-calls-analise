@@ -5,17 +5,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Armazena calls em memória (simples, sem banco de dados)
+// Mapeamento email → nome do SDR
+const SDR_MAP = {
+  'jpboubeemuniz@gmail.com': 'João Muniz',
+  'victorcontato.ra@gmail.com': 'Victor Hugo',
+};
+const SDR_EMAILS = Object.keys(SDR_MAP);
+
 let calls = [];
 let callIdCounter = 1;
 
 // ─── WEBHOOK DO OPENPHONE ───────────────────────────────────────────────────
-// OpenPhone vai chamar esta rota automaticamente após cada call
 app.post('/webhook/openphone', async (req, res) => {
   try {
     const event = req.body;
 
-    // OpenPhone envia evento "call.completed" com transcrição
     if (event.type !== 'call.completed') {
       return res.json({ ok: true, skipped: true });
     }
@@ -26,19 +30,25 @@ app.post('/webhook/openphone', async (req, res) => {
     const transcript = call.transcript || '';
     const duration = call.duration || 0;
     const direction = call.direction || 'inbound';
-    const status = call.status || 'completed';
-    const from = call.from || '';
     const to = call.to || '';
-    const userId = call.userId || '';
+    const userEmail = call.user?.email || '';
     const answeredAt = call.answeredAt;
+
+    // Filtra — só processa calls do João Muniz e Victor Hugo
+    if (userEmail && !SDR_EMAILS.includes(userEmail)) {
+      return res.json({ ok: true, skipped: true, reason: 'SDR não monitorado' });
+    }
+
+    // Resolve nome pelo email
+    const sdrName = SDR_MAP[userEmail] || userEmail || 'SDR';
 
     // Se não atendeu, registra sem análise
     if (!answeredAt || duration < 10) {
       const newCall = {
         id: callIdCounter++,
         lead: to,
-        meta: 'Sem informação',
-        sdr: userId,
+        meta: direction === 'outbound' ? 'Outbound' : 'Inbound',
+        sdr: sdrName,
         status: 'nao_atendeu',
         result: 'nao_atendeu',
         duration: '—',
@@ -52,28 +62,26 @@ app.post('/webhook/openphone', async (req, res) => {
       return res.json({ ok: true, callId: newCall.id });
     }
 
-    // Formata duração
     const mins = Math.floor(duration / 60);
     const secs = duration % 60;
-    const durationStr = `${mins}:${secs.toString().padStart(2,'0')}`;
+    const durationStr = `${mins}:${secs.toString().padStart(2, '0')}`;
 
-    // Analisa com Claude se tiver transcrição
     let analysis = null;
     if (transcript && transcript.length > 50) {
-      analysis = await analyzeWithClaude(transcript, userId);
+      analysis = await analyzeWithClaude(transcript, sdrName);
     }
 
     const newCall = {
       id: callIdCounter++,
       lead: to,
-      meta: direction === 'outbound' ? 'Outbound call' : 'Inbound call',
-      sdr: userId,
+      meta: direction === 'outbound' ? 'Outbound' : 'Inbound',
+      sdr: sdrName,
       status: 'atendida',
       result: analysis?.agendou ? 'agendou' : 'nao_agendou',
       duration: durationStr,
       score: analysis?.score || 0,
       transcript: transcript,
-      issues: analysis?.pontos_positivos?.concat(analysis?.erros?.map(e => '⚠️ ' + e)) || [],
+      issues: (analysis?.pontos_positivos || []).concat((analysis?.erros || []).map(e => '⚠️ ' + e)),
       suggestion: analysis?.sugestao || '',
       scores_detalhados: analysis?.scores_detalhados || {},
       resumo: analysis?.resumo || '',
@@ -89,7 +97,6 @@ app.post('/webhook/openphone', async (req, res) => {
   }
 });
 
-// ─── ANALISAR TRANSCRIÇÃO MANUALMENTE ──────────────────────────────────────
 app.post('/api/analyze', async (req, res) => {
   try {
     const { transcript, sdr, lead, result } = req.body;
@@ -122,15 +129,11 @@ app.post('/api/analyze', async (req, res) => {
   }
 });
 
-// ─── LISTAR CALLS ───────────────────────────────────────────────────────────
 app.get('/api/calls', (req, res) => {
   const { filter, date } = req.query;
   let data = [...calls];
 
-  if (date) {
-    data = data.filter(c => c.createdAt.startsWith(date));
-  }
-
+  if (date) data = data.filter(c => c.createdAt.startsWith(date));
   if (filter === 'atendida') data = data.filter(c => c.status === 'atendida');
   else if (filter === 'nao_atendeu') data = data.filter(c => c.status === 'nao_atendeu');
   else if (filter === 'agendou') data = data.filter(c => c.result === 'agendou');
@@ -140,7 +143,6 @@ app.get('/api/calls', (req, res) => {
   res.json({ calls: data, total: data.length });
 });
 
-// ─── STATS DO DIA ───────────────────────────────────────────────────────────
 app.get('/api/stats', (req, res) => {
   const today = new Date().toISOString().split('T')[0];
   const todayCalls = calls.filter(c => c.createdAt.startsWith(today));
@@ -152,18 +154,14 @@ app.get('/api/stats', (req, res) => {
   const scoreTotal = todayCalls.filter(c => c.score > 0).reduce((a, c) => a + c.score, 0);
   const scoreMedio = atendidas > 0 ? Math.round(scoreTotal / atendidas) : 0;
 
-  // Objeções frequentes
   const objecoes = {};
   todayCalls.forEach(c => {
-    (c.erros || []).forEach(e => {
-      objecoes[e] = (objecoes[e] || 0) + 1;
-    });
+    (c.erros || []).forEach(e => { objecoes[e] = (objecoes[e] || 0) + 1; });
   });
 
   res.json({ total, atendidas, agendamentos, naoAtendeu, scoreMedio, objecoes });
 });
 
-// ─── FUNÇÃO DE ANÁLISE COM CLAUDE ──────────────────────────────────────────
 async function analyzeWithClaude(transcript, sdr = 'SDR', lead = 'Lead') {
   const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
   if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY não configurada');
