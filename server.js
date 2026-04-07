@@ -20,7 +20,7 @@ app.post('/webhook/openphone', async (req, res) => {
   try {
     const event = req.body;
 
-    if (event.type !== 'call.completed') {
+    if (event.type !== 'call.transcript.completed') {
       return res.json({ ok: true, skipped: true });
     }
 
