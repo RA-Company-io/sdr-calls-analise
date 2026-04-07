@@ -5,12 +5,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Mapeamento email → nome do SDR
+// Mapeamento userId → nome do SDR
+// Victor Hugo: USgCXC5yNi
+// João Muniz: adicionar após call de teste dele
 const SDR_MAP = {
-  'jpboubeemuniz@gmail.com': 'João Muniz',
-  'victorcontato.ra@gmail.com': 'Victor Hugo',
+  'USgCXC5yNi': 'Victor Hugo',
+  'USeF2q4DqR': 'João Muniz', // substituir após call de teste
 };
-const SDR_EMAILS = Object.keys(SDR_MAP);
+const SDR_IDS = Object.keys(SDR_MAP);
 
 let calls = [];
 let callIdCounter = 1;
@@ -19,78 +21,95 @@ let callIdCounter = 1;
 app.post('/webhook/openphone', async (req, res) => {
   try {
     const event = req.body;
-    console.log('WEBHOOK FULL:', JSON.stringify(event, null, 2));
+    console.log('WEBHOOK TYPE:', event.type);
 
-    if (event.type !== 'call.transcript.completed') {
-      return res.json({ ok: true, skipped: true });
-    }
+    // Processa call.completed (registra a call)
+    if (event.type === 'call.completed') {
+      const call = event.data?.object;
+      if (!call) return res.json({ ok: true, skipped: true });
 
-    const call = event.data?.object;
-    if (!call) return res.json({ ok: true, skipped: true });
+      const userId = call.userId || '';
+      const duration = call.duration || 0;
+      const direction = call.direction || 'outgoing';
+      const to = call.to || '';
+      const answeredAt = call.answeredAt;
+      const callId = call.id || '';
 
-    const transcript = call.transcript || '';
-    const duration = call.duration || 0;
-    const direction = call.direction || 'inbound';
-    const to = call.to || '';
-    const userEmail = call.user?.email || '';
-    const answeredAt = call.answeredAt;
+      console.log('call.completed - userId:', userId, 'duration:', duration, 'to:', to);
 
-    // Filtra — só processa calls do João Muniz e Victor Hugo
-    if (userEmail && !SDR_EMAILS.includes(userEmail)) {
-      return res.json({ ok: true, skipped: true, reason: 'SDR não monitorado' });
-    }
+      // Filtra — só processa calls dos SDRs monitorados
+      if (!SDR_IDS.includes(userId)) {
+        console.log('SDR não monitorado:', userId);
+        return res.json({ ok: true, skipped: true, reason: 'SDR não monitorado' });
+      }
 
-    // Resolve nome pelo email
-    const sdrName = SDR_MAP[userEmail] || userEmail || 'SDR';
+      const sdrName = SDR_MAP[userId];
+      const mins = Math.floor(duration / 60);
+      const secs = duration % 60;
+      const durationStr = duration > 0 ? `${mins}:${secs.toString().padStart(2, '0')}` : '—';
 
-    // Se não atendeu, registra sem análise
-    if (!answeredAt || duration < 10) {
       const newCall = {
         id: callIdCounter++,
+        openPhoneId: callId,
         lead: to,
-        meta: direction === 'outbound' ? 'Outbound' : 'Inbound',
+        meta: direction === 'outgoing' ? 'Outbound' : 'Inbound',
         sdr: sdrName,
-        status: 'nao_atendeu',
-        result: 'nao_atendeu',
-        duration: '—',
+        status: !answeredAt || duration < 10 ? 'nao_atendeu' : 'atendida',
+        result: !answeredAt || duration < 10 ? 'nao_atendeu' : 'nao_agendou',
+        duration: durationStr,
         score: 0,
         transcript: '',
-        issues: ['Lead não atendeu a ligação'],
-        suggestion: 'Tentar novamente entre 8h–10h ou 16h–18h. Enviar WhatsApp antes.',
+        issues: !answeredAt || duration < 10 ? ['Lead não atendeu a ligação'] : [],
+        suggestion: !answeredAt || duration < 10 ? 'Tentar novamente entre 8h–10h ou 16h–18h.' : '',
+        scores_detalhados: {},
+        resumo: '',
         createdAt: new Date().toISOString(),
       };
+
       calls.unshift(newCall);
       return res.json({ ok: true, callId: newCall.id });
     }
 
-    const mins = Math.floor(duration / 60);
-    const secs = duration % 60;
-    const durationStr = `${mins}:${secs.toString().padStart(2, '0')}`;
+    // Processa call.transcript.completed (analisa com Claude)
+    if (event.type === 'call.transcript.completed') {
+      const obj = event.data?.object;
+      if (!obj) return res.json({ ok: true, skipped: true });
 
-    let analysis = null;
-    if (transcript && transcript.length > 50) {
-      analysis = await analyzeWithClaude(transcript, sdrName);
+      const callId = obj.callId || '';
+      const dialogue = obj.dialogue || [];
+
+      // Monta transcrição a partir do dialogue
+      const transcript = dialogue.map(d => `${d.identifier || 'Speaker'}: ${d.content}`).join('\n');
+      console.log('transcript.completed - callId:', callId, 'linhas:', dialogue.length);
+
+      // Encontra a call já registrada
+      const existing = calls.find(c => c.openPhoneId === callId);
+      if (!existing) {
+        console.log('Call não encontrada para transcript:', callId);
+        return res.json({ ok: true, skipped: true });
+      }
+
+      // Atualiza com transcrição e análise
+      existing.transcript = transcript;
+      if (transcript && transcript.length > 50) {
+        try {
+          const analysis = await analyzeWithClaude(transcript, existing.sdr);
+          existing.score = analysis?.score || 0;
+          existing.issues = (analysis?.pontos_positivos || []).concat((analysis?.erros || []).map(e => '⚠️ ' + e));
+          existing.suggestion = analysis?.sugestao || '';
+          existing.scores_detalhados = analysis?.scores_detalhados || {};
+          existing.resumo = analysis?.resumo || '';
+          existing.result = analysis?.agendou ? 'agendou' : 'nao_agendou';
+          console.log('Análise concluída - score:', existing.score);
+        } catch (e) {
+          console.error('Erro na análise Claude:', e.message);
+        }
+      }
+
+      return res.json({ ok: true, updated: true });
     }
 
-    const newCall = {
-      id: callIdCounter++,
-      lead: to,
-      meta: direction === 'outbound' ? 'Outbound' : 'Inbound',
-      sdr: sdrName,
-      status: 'atendida',
-      result: analysis?.agendou ? 'agendou' : 'nao_agendou',
-      duration: durationStr,
-      score: analysis?.score || 0,
-      transcript: transcript,
-      issues: (analysis?.pontos_positivos || []).concat((analysis?.erros || []).map(e => '⚠️ ' + e)),
-      suggestion: analysis?.sugestao || '',
-      scores_detalhados: analysis?.scores_detalhados || {},
-      resumo: analysis?.resumo || '',
-      createdAt: new Date().toISOString(),
-    };
-
-    calls.unshift(newCall);
-    res.json({ ok: true, callId: newCall.id });
+    return res.json({ ok: true, skipped: true });
 
   } catch (err) {
     console.error('Webhook error:', err);
@@ -98,6 +117,7 @@ app.post('/webhook/openphone', async (req, res) => {
   }
 });
 
+// ─── ANALISAR MANUALMENTE ───────────────────────────────────────────────────
 app.post('/api/analyze', async (req, res) => {
   try {
     const { transcript, sdr, lead, result } = req.body;
@@ -130,6 +150,7 @@ app.post('/api/analyze', async (req, res) => {
   }
 });
 
+// ─── LISTAR CALLS ───────────────────────────────────────────────────────────
 app.get('/api/calls', (req, res) => {
   const { filter, date } = req.query;
   let data = [...calls];
@@ -144,6 +165,7 @@ app.get('/api/calls', (req, res) => {
   res.json({ calls: data, total: data.length });
 });
 
+// ─── STATS DO DIA ───────────────────────────────────────────────────────────
 app.get('/api/stats', (req, res) => {
   const today = new Date().toISOString().split('T')[0];
   const todayCalls = calls.filter(c => c.createdAt.startsWith(today));
@@ -163,6 +185,7 @@ app.get('/api/stats', (req, res) => {
   res.json({ total, atendidas, agendamentos, naoAtendeu, scoreMedio, objecoes });
 });
 
+// ─── CLAUDE ─────────────────────────────────────────────────────────────────
 async function analyzeWithClaude(transcript, sdr = 'SDR', lead = 'Lead') {
   const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
   if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY não configurada');
