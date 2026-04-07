@@ -6,16 +6,39 @@ app.use(cors());
 app.use(express.json());
 
 // Mapeamento userId → nome do SDR
-// Victor Hugo: USgCXC5yNi
-// João Muniz: adicionar após call de teste dele
 const SDR_MAP = {
   'USgCXC5yNi': 'Victor Hugo',
-  'USeF2q4DqR': 'João Muniz', // substituir após call de teste
+  'USeF2q4DqR': 'João Muniz',
 };
 const SDR_IDS = Object.keys(SDR_MAP);
 
+// Voicemail keywords — português e inglês
+const VOICEMAIL_KEYWORDS = [
+  'forwarded to', 'leave a message', 'voicemail', 'not available',
+  'please leave', 'after the tone', 'call has been forwarded',
+  'deixe sua mensagem', 'não disponível', 'caixa postal',
+  'deixe uma mensagem', 'após o sinal', 'fora da área',
+  'não foi possível completar', 'tente novamente mais tarde'
+];
+
+function isVoicemail(dialogue) {
+  if (!dialogue || dialogue.length === 0) return true;
+  const text = dialogue.map(d => d.content || '').join(' ').toLowerCase();
+  return VOICEMAIL_KEYWORDS.some(kw => text.includes(kw));
+}
+
+function isRealConversation(dialogue) {
+  if (!dialogue || dialogue.length < 2) return false;
+  if (isVoicemail(dialogue)) return false;
+  const identifiers = new Set(dialogue.map(d => d.identifier));
+  return identifiers.size >= 2;
+}
+
 let calls = [];
 let callIdCounter = 1;
+
+// Fila de transcrições que chegaram antes da call ser registrada
+let pendingTranscripts = [];
 
 // ─── WEBHOOK DO OPENPHONE ───────────────────────────────────────────────────
 app.post('/webhook/openphone', async (req, res) => {
@@ -23,30 +46,26 @@ app.post('/webhook/openphone', async (req, res) => {
     const event = req.body;
     console.log('WEBHOOK TYPE:', event.type);
 
-    // Processa call.completed (registra a call)
+    // ── call.completed — registra a call ──
     if (event.type === 'call.completed') {
       const call = event.data?.object;
       if (!call) return res.json({ ok: true, skipped: true });
 
       const userId = call.userId || '';
-      const duration = call.duration || 0;
       const direction = call.direction || 'outgoing';
       const to = call.to || '';
       const answeredAt = call.answeredAt;
       const callId = call.id || '';
 
-      console.log('call.completed - userId:', userId, 'duration:', duration, 'to:', to);
+      console.log('call.completed - userId:', userId, 'answeredAt:', answeredAt, 'to:', to);
 
-      // Filtra — só processa calls dos SDRs monitorados
       if (!SDR_IDS.includes(userId)) {
         console.log('SDR não monitorado:', userId);
-        return res.json({ ok: true, skipped: true, reason: 'SDR não monitorado' });
+        return res.json({ ok: true, skipped: true });
       }
 
       const sdrName = SDR_MAP[userId];
-      const mins = Math.floor(duration / 60);
-      const secs = duration % 60;
-      const durationStr = duration > 0 ? `${mins}:${secs.toString().padStart(2, '0')}` : '—';
+      const atendeu = !!answeredAt;
 
       const newCall = {
         id: callIdCounter++,
@@ -54,23 +73,32 @@ app.post('/webhook/openphone', async (req, res) => {
         lead: to,
         meta: direction === 'outgoing' ? 'Outbound' : 'Inbound',
         sdr: sdrName,
-        status: !answeredAt || duration < 10 ? 'nao_atendeu' : 'atendida',
-        result: !answeredAt || duration < 10 ? 'nao_atendeu' : 'nao_agendou',
-        duration: durationStr,
+        status: atendeu ? 'atendida' : 'nao_atendeu',
+        result: atendeu ? 'nao_agendou' : 'nao_atendeu',
+        duration: '—',
         score: 0,
         transcript: '',
-        issues: !answeredAt || duration < 10 ? ['Lead não atendeu a ligação'] : [],
-        suggestion: !answeredAt || duration < 10 ? 'Tentar novamente entre 8h–10h ou 16h–18h.' : '',
+        issues: atendeu ? [] : ['Lead não atendeu a ligação'],
+        suggestion: atendeu ? '' : 'Tentar novamente entre 8h–10h ou 16h–18h.',
         scores_detalhados: {},
         resumo: '',
         createdAt: new Date().toISOString(),
       };
 
       calls.unshift(newCall);
+
+      // Verifica se já tinha transcrição pendente para essa call
+      const pending = pendingTranscripts.find(p => p.callId === callId);
+      if (pending) {
+        console.log('Processando transcrição pendente para:', callId);
+        pendingTranscripts = pendingTranscripts.filter(p => p.callId !== callId);
+        await processTranscript(newCall, pending.dialogue);
+      }
+
       return res.json({ ok: true, callId: newCall.id });
     }
 
-    // Processa call.transcript.completed (analisa com Claude)
+    // ── call.transcript.completed — analisa com Claude ──
     if (event.type === 'call.transcript.completed') {
       const obj = event.data?.object;
       if (!obj) return res.json({ ok: true, skipped: true });
@@ -78,34 +106,20 @@ app.post('/webhook/openphone', async (req, res) => {
       const callId = obj.callId || '';
       const dialogue = obj.dialogue || [];
 
-      // Monta transcrição a partir do dialogue
-      const transcript = dialogue.map(d => `${d.identifier || 'Speaker'}: ${d.content}`).join('\n');
       console.log('transcript.completed - callId:', callId, 'linhas:', dialogue.length);
 
-      // Encontra a call já registrada
       const existing = calls.find(c => c.openPhoneId === callId);
+
       if (!existing) {
-        console.log('Call não encontrada para transcript:', callId);
-        return res.json({ ok: true, skipped: true });
+        // Guarda na fila — call.completed ainda não chegou
+        console.log('Call não encontrada ainda — guardando na fila:', callId);
+        pendingTranscripts.push({ callId, dialogue, receivedAt: Date.now() });
+        // Limpa pendentes com mais de 5 minutos
+        pendingTranscripts = pendingTranscripts.filter(p => Date.now() - p.receivedAt < 300000);
+        return res.json({ ok: true, queued: true });
       }
 
-      // Atualiza com transcrição e análise
-      existing.transcript = transcript;
-      if (transcript && transcript.length > 50) {
-        try {
-          const analysis = await analyzeWithClaude(transcript, existing.sdr);
-          existing.score = analysis?.score || 0;
-          existing.issues = (analysis?.pontos_positivos || []).concat((analysis?.erros || []).map(e => '⚠️ ' + e));
-          existing.suggestion = analysis?.sugestao || '';
-          existing.scores_detalhados = analysis?.scores_detalhados || {};
-          existing.resumo = analysis?.resumo || '';
-          existing.result = analysis?.agendou ? 'agendou' : 'nao_agendou';
-          console.log('Análise concluída - score:', existing.score);
-        } catch (e) {
-          console.error('Erro na análise Claude:', e.message);
-        }
-      }
-
+      await processTranscript(existing, dialogue);
       return res.json({ ok: true, updated: true });
     }
 
@@ -116,6 +130,50 @@ app.post('/webhook/openphone', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ─── PROCESSA TRANSCRIÇÃO ────────────────────────────────────────────────────
+async function processTranscript(callObj, dialogue) {
+  if (isVoicemail(dialogue)) {
+    console.log('Voicemail detectado — removendo:', callObj.openPhoneId);
+    calls = calls.filter(c => c.openPhoneId !== callObj.openPhoneId);
+    return;
+  }
+
+  if (!isRealConversation(dialogue)) {
+    console.log('Conversa muito curta — removendo:', callObj.openPhoneId);
+    calls = calls.filter(c => c.openPhoneId !== callObj.openPhoneId);
+    return;
+  }
+
+  // Monta transcrição
+  const transcript = dialogue.map(d => `${d.identifier || 'Speaker'}: ${d.content}`).join('\n');
+  callObj.transcript = transcript;
+  callObj.status = 'atendida';
+
+  // Calcula duração pelo dialogue
+  if (dialogue.length > 0) {
+    const lastLine = dialogue[dialogue.length - 1];
+    const totalSecs = Math.round(lastLine.end || 0);
+    const mins = Math.floor(totalSecs / 60);
+    const secs = totalSecs % 60;
+    callObj.duration = `${mins}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  // Analisa com Claude
+  try {
+    const analysis = await analyzeWithClaude(transcript, callObj.sdr);
+    callObj.score = analysis?.score || 0;
+    callObj.issues = (analysis?.pontos_positivos || []).concat((analysis?.erros || []).map(e => '⚠️ ' + e));
+    callObj.erros = analysis?.erros || [];
+    callObj.suggestion = analysis?.sugestao || '';
+    callObj.scores_detalhados = analysis?.scores_detalhados || {};
+    callObj.resumo = analysis?.resumo || '';
+    callObj.result = analysis?.agendou ? 'agendou' : 'nao_agendou';
+    console.log('Análise concluída - score:', callObj.score);
+  } catch (e) {
+    console.error('Erro Claude:', e.message);
+  }
+}
 
 // ─── ANALISAR MANUALMENTE ───────────────────────────────────────────────────
 app.post('/api/analyze', async (req, res) => {
@@ -136,6 +194,7 @@ app.post('/api/analyze', async (req, res) => {
       score: analysis?.score || 0,
       transcript,
       issues: (analysis?.pontos_positivos || []).concat((analysis?.erros || []).map(e => '⚠️ ' + e)),
+      erros: analysis?.erros || [],
       suggestion: analysis?.sugestao || '',
       scores_detalhados: analysis?.scores_detalhados || {},
       resumo: analysis?.resumo || '',
@@ -165,7 +224,7 @@ app.get('/api/calls', (req, res) => {
   res.json({ calls: data, total: data.length });
 });
 
-// ─── STATS DO DIA ───────────────────────────────────────────────────────────
+// ─── STATS ───────────────────────────────────────────────────────────────────
 app.get('/api/stats', (req, res) => {
   const today = new Date().toISOString().split('T')[0];
   const todayCalls = calls.filter(c => c.createdAt.startsWith(today));
@@ -177,15 +236,18 @@ app.get('/api/stats', (req, res) => {
   const scoreTotal = todayCalls.filter(c => c.score > 0).reduce((a, c) => a + c.score, 0);
   const scoreMedio = atendidas > 0 ? Math.round(scoreTotal / atendidas) : 0;
 
+  // Corrigido — usa c.erros (array separado)
   const objecoes = {};
   todayCalls.forEach(c => {
-    (c.erros || []).forEach(e => { objecoes[e] = (objecoes[e] || 0) + 1; });
+    (c.erros || []).forEach(e => {
+      objecoes[e] = (objecoes[e] || 0) + 1;
+    });
   });
 
   res.json({ total, atendidas, agendamentos, naoAtendeu, scoreMedio, objecoes });
 });
 
-// ─── CLAUDE ─────────────────────────────────────────────────────────────────
+// ─── CLAUDE ──────────────────────────────────────────────────────────────────
 async function analyzeWithClaude(transcript, sdr = 'SDR', lead = 'Lead') {
   const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
   if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY não configurada');
