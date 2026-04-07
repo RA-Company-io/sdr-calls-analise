@@ -19,6 +19,7 @@ let callIdCounter = 1;
 app.post('/webhook/openphone', async (req, res) => {
   try {
     const event = req.body;
+    console.log('WEBHOOK FULL:', JSON.stringify(event, null, 2));
 
     if (event.type !== 'call.transcript.completed') {
       return res.json({ ok: true, skipped: true });
